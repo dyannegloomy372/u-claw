@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# U-Claw - Portable AI Agent
+# U-Claw - Portable AI Agent (macOS)
 # Double-click to start / 双击启动
 # ============================================================
 
@@ -8,19 +8,20 @@ UCLAW_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR="$UCLAW_DIR/app"
 CORE_DIR="$APP_DIR/core"
 DATA_DIR="$UCLAW_DIR/data"
+STATE_DIR="$DATA_DIR/.openclaw"
+CONFIG_FILE="$STATE_DIR/openclaw.json"
 
 # Migration shim: rename old core-mac to core for existing USB users
 if [ -d "$APP_DIR/core-mac" ] && [ ! -d "$APP_DIR/core" ]; then
     mv "$APP_DIR/core-mac" "$APP_DIR/core"
 fi
 
+RED='\033[0;31m'
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
-RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-clear
 echo ""
 echo -e "${CYAN}"
 echo "  ╔══════════════════════════════════════╗"
@@ -57,7 +58,7 @@ fi
 # ---- 3. Check runtime ----
 if [ ! -f "$NODE_BIN" ]; then
     echo -e "  ${RED}Error: Node.js runtime not found${NC}"
-    echo "  Please ensure app/runtime/ is complete"
+    echo "  Please run: bash setup.sh"
     read -p "  Press Enter to exit..."
     exit 1
 fi
@@ -66,13 +67,13 @@ NODE_VER=$("$NODE_BIN" --version)
 echo -e "  Node.js: ${GREEN}${NODE_VER}${NC}"
 echo ""
 
-# ---- 4. Check & init data ----
-mkdir -p "$DATA_DIR/memory" "$DATA_DIR/backups" "$DATA_DIR/logs"
+# ---- 4. Init data directories ----
+mkdir -p "$STATE_DIR" "$DATA_DIR/memory" "$DATA_DIR/backups" "$DATA_DIR/logs"
 
-if [ ! -f "$DATA_DIR/config.json" ] && [ ! -f "$DATA_DIR/.openclaw/openclaw.json" ]; then
+# ---- 5. Default config ----
+if [ ! -f "$CONFIG_FILE" ]; then
     echo -e "  ${YELLOW}First run - creating default config...${NC}"
-    mkdir -p "$DATA_DIR/.openclaw"
-    cat > "$DATA_DIR/.openclaw/openclaw.json" << 'CFGEOF'
+    cat > "$CONFIG_FILE" << 'CFGEOF'
 {
   "gateway": {
     "mode": "local",
@@ -84,20 +85,17 @@ CFGEOF
     echo ""
 fi
 
-# ---- 5. Set environment (portable mode) ----
-STATE_DIR="$DATA_DIR/.openclaw"
-mkdir -p "$STATE_DIR"
-
-# Sync config to where OpenClaw expects it
-if [ -f "$DATA_DIR/config.json" ] && [ ! -f "$STATE_DIR/openclaw.json" ]; then
-    cp "$DATA_DIR/config.json" "$STATE_DIR/openclaw.json"
+# Sync config from legacy location
+if [ -f "$DATA_DIR/config.json" ] && [ ! -f "$CONFIG_FILE" ]; then
+    cp "$DATA_DIR/config.json" "$CONFIG_FILE"
 fi
 
+# ---- 6. Set environment (portable mode) ----
 export OPENCLAW_HOME="$DATA_DIR"
 export OPENCLAW_STATE_DIR="$STATE_DIR"
-export OPENCLAW_CONFIG_PATH="$STATE_DIR/openclaw.json"
+export OPENCLAW_CONFIG_PATH="$CONFIG_FILE"
 
-# ---- 6. Check dependencies ----
+# ---- 7. Check dependencies ----
 if [ ! -d "$CORE_DIR/node_modules" ]; then
     echo -e "  ${YELLOW}First run - installing dependencies...${NC}"
     echo "  (Using China mirror)"
@@ -107,9 +105,7 @@ if [ ! -d "$CORE_DIR/node_modules" ]; then
     echo ""
 fi
 
-# OpenClaw doesn't need a separate build step when installed via npm
-
-# ---- 7. Find available port ----
+# ---- 8. Find available port ----
 PORT=18789
 while lsof -i :$PORT >/dev/null 2>&1; do
     echo -e "  ${YELLOW}Port $PORT in use, trying next...${NC}"
@@ -121,69 +117,51 @@ while lsof -i :$PORT >/dev/null 2>&1; do
     fi
 done
 
-# Update config with correct port if changed
-if [ $PORT -ne 18789 ]; then
-    "$NODE_BIN" -e "
-        const fs = require('fs');
-        const p = '$DATA_DIR/config.json';
-        const c = JSON.parse(fs.readFileSync(p, 'utf8'));
-        c.gateway = c.gateway || {};
-        c.gateway.port = $PORT;
-        fs.writeFileSync(p, JSON.stringify(c, null, 2));
-    " 2>/dev/null || true
-fi
+# ---- 9. Start Config Server in background ----
+echo -e "  ${CYAN}Starting Config Center on port 18788...${NC}"
+CONFIG_SERVER="$UCLAW_DIR/config-server"
+"$NODE_BIN" "$CONFIG_SERVER/server.js" &
+CONFIG_PID=$!
+sleep 1
 
-# ---- 8. Start gateway ----
+# ---- 10. Start gateway ----
 echo -e "  ${CYAN}Starting OpenClaw on port $PORT...${NC}"
-echo "  Do NOT close this window."
 echo ""
 
 cd "$CORE_DIR"
-
-TOKEN=$(python3 -c "import json,os; p='$STATE_DIR/openclaw.json' if os.path.exists('$STATE_DIR/openclaw.json') else '$DATA_DIR/config.json'; d=json.load(open(p)); print(d.get('gateway',{}).get('auth',{}).get('token','uclaw'))" 2>/dev/null || echo "uclaw")
-
 OPENCLAW_MJS="$CORE_DIR/node_modules/openclaw/openclaw.mjs"
-GW_LOG="$DATA_DIR/logs/gateway.log"
-"$NODE_BIN" "$OPENCLAW_MJS" gateway run --allow-unconfigured --force --port $PORT 2>&1 | tee -a "$GW_LOG" &
+"$NODE_BIN" "$OPENCLAW_MJS" gateway run --allow-unconfigured --force --port $PORT &
 GW_PID=$!
 
-# ---- 9. Wait & open browser ----
+# ---- 11. Wait for gateway, then open browser ----
 for i in $(seq 1 30); do
     sleep 0.5
-    if curl -s -o /dev/null -w '' "http://127.0.0.1:$PORT/" 2>/dev/null; then
-        DASHBOARD_URL="http://127.0.0.1:$PORT/#token=${TOKEN}"
-        CONFIG_PAGE="$UCLAW_DIR/Config.html?port=$PORT"
-        echo ""
-        echo -e "  ${GREEN}✅ Started successfully!${NC}"
-        echo ""
-
-        # Check if model is configured
-        HAS_MODEL=$(python3 -c "
-import json,os
-for p in ['$STATE_DIR/openclaw.json','$DATA_DIR/config.json']:
-    if os.path.exists(p):
-        d=json.load(open(p))
-        if d.get('agent',{}).get('model'):
-            print('yes'); break
-" 2>/dev/null)
-
-        if [ "$HAS_MODEL" = "yes" ]; then
-            echo -e "  ${CYAN}Dashboard: ${DASHBOARD_URL}${NC}"
-            echo ""
-            open "$DASHBOARD_URL" 2>/dev/null
-        else
-            echo -e "  ${YELLOW}首次使用，打开配置页面...${NC}"
-            echo -e "  ${CYAN}配置页面: Config.html${NC}"
-            echo -e "  ${CYAN}控制台: ${DASHBOARD_URL}${NC}"
-            echo ""
-            open "$CONFIG_PAGE" 2>/dev/null
-        fi
+    if curl -s -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null; then
+        # Open Dashboard
+        open "http://127.0.0.1:$PORT/#token=uclaw" 2>/dev/null || true
+        # Open Config Center
+        open "http://127.0.0.1:18788/" 2>/dev/null || true
         break
     fi
 done
 
-wait $GW_PID
-
+echo -e "  ${GREEN}════════════════════════════════${NC}"
+echo -e "  ${GREEN}🦞 U-Claw is running!${NC}"
+echo -e "  ${GREEN}   Dashboard:     http://127.0.0.1:$PORT/#token=uclaw${NC}"
+echo -e "  ${GREEN}   Config Center: http://127.0.0.1:18788/${NC}"
 echo ""
-echo -e "  ${YELLOW}OpenClaw stopped.${NC}"
-read -p "  Press Enter to close..."
+echo -e "  ${YELLOW}Press Ctrl+C to stop${NC}"
+echo -e "  ${GREEN}════════════════════════════════${NC}"
+echo ""
+
+# ---- Cleanup on exit ----
+cleanup() {
+    kill $GW_PID 2>/dev/null
+    kill $CONFIG_PID 2>/dev/null
+    echo ""
+    echo -e "  🦞 U-Claw stopped."
+    exit 0
+}
+trap cleanup INT TERM
+
+wait $GW_PID
